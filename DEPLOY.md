@@ -221,3 +221,12 @@ package.json 中 `tensorlake` **必须精确锁定 `0.5.0`**（不带 `^`）：
   EdgeOne 上实测可用。SDK 对外 API（`Sandbox.create` / `sb.run` /
   `terminate` 等）与 `lib/sandbox.js` 的探测式调用完全兼容。
 - 升级 SDK 前务必先在 EdgeOne 环境验证 native-worker 子路径可解析。
+
+### undici 版本覆盖（2026-10-19 第二次修复）
+
+锁定 0.5.0 后线上仍报 `Cannot read properties of undefined (reading 'bind')`：
+tensorlake 0.5.0 声明的 `undici: ^8.1.0` 实际装到 8.x，而 **undici 8 要求
+Node ≥ 22.19**，EdgeOne 云函数是 **Node 20** 运行时，不兼容。已在
+package.json 用 `overrides` 把 undici 压到 `6.29.1`（Node ≥ 18 可用，
+SDK 仅用 Agent / fetch / setGlobalDispatcher，v6 全部支持）。
+**EdgeOne 控制台的 Node 版本升级到 22+ 前请勿移除此 overrides。**
