@@ -38,7 +38,7 @@
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
-import { create, createSession, connect, exec, initWorkdir, WORKDIR, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
+import { create, createSession, connect, exec, initWorkdir, ensureRuntime, WORKDIR, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
 
 // 并发锁：按「执行单元」隔离——无 session 的普通任务共用 '__single__'
 // （保持原全局 busy 语义），会话任务按 session id 各自一把锁，
@@ -170,7 +170,7 @@ export async function onRequest(context) {
           //   超时，此处再兜底），必须在 EdgeOne 120s 平台强杀【之前】发可
           //   解析的 error 帧正常关流——被强杀的流客户端只能看到静默 EOF，
           //   表现为「沙盒未返回内容」这类无根因报错。
-          const WATCHDOG_MS = clamp(Number(env.STREAM_WATCHDOG_MS || 100_000), 30_000, 115_000);
+          const WATCHDOG_MS = clamp(Number(env.STREAM_WATCHDOG_MS || 115_000), 30_000, 118_000);
           const loop = runTaskLoop(env, {
             task, directCmd, maxTurns, budgetMs, cmdMs,
             keepAlive, clientSandboxId,
@@ -272,6 +272,7 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
       sandboxId = keepAlive ? sb?.sandboxId ?? null : null;
       reused = keepAlive && sb?._reused === true;
       await initWorkdir(sb);
+      await ensureRuntime(sb);
       const out = await exec(sb, directCmd, cmdMs, WORKDIR);
       turns.push({ i: 1, thought: '', command: directCmd, output: out });
       if (emit) {
@@ -331,6 +332,7 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
             sb = await create(env);
           }
           await initWorkdir(sb);
+          await ensureRuntime(sb);
         }
       } catch (e) {
         turns.push({ i, thought: d.thought, command: d.command, output: `沙盒创建失败: ${e.message}` });
