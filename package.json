@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Tensorlake sandbox + OpenAI-compatible LLM agent loop on EdgeOne Pages",
   "dependencies": {
-    "tensorlake": "^0.5.0"
+    "tensorlake": "0.5.0"
   }
 }

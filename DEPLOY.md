@@ -206,3 +206,18 @@ orion 转成 502（不误导客户端重新登录）；429/500 原样透传。
 
 **本服务零改动**：orion 后端以 `X-Orion-Token`/`Authorization: Bearer <客户端令牌>`
 调用，落入白名单 introspect 通道，与直连场景完全一致。
+
+## ⚠️ tensorlake 版本锁定说明（2026-10-19）
+
+package.json 中 `tensorlake` **必须精确锁定 `0.5.0`**（不带 `^`）：
+
+- 新版（约 0.5.1x 起）SDK 拆分为「壳包 + `@tensorlakeai/tensorlake` scoped 包」，
+  scoped 包内部会 `import('@tensorlakeai/tensorlake/internal/native-worker')`
+  自引用一个 `.cjs` 子路径。EdgeOne 云函数的打包/运行时无法解析这种
+  scoped 自引用子路径，线上实测报错：
+  `Cannot find module '@tensorlakeai/tensorlake/internal/native-worker'`，
+  导致所有沙盒创建失败（finish=sandbox_error）。
+- 0.5.0 为自包含纯 HTTP 实现（undici + ws），无 scoped 子包、无自引用，
+  EdgeOne 上实测可用。SDK 对外 API（`Sandbox.create` / `sb.run` /
+  `terminate` 等）与 `lib/sandbox.js` 的探测式调用完全兼容。
+- 升级 SDK 前务必先在 EdgeOne 环境验证 native-worker 子路径可解析。
