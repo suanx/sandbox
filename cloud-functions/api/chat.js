@@ -11,6 +11,11 @@
 //   任务结束 / 超时 / 出错 → 立刻 terminate（finally 保证）
 //
 // 无 KV、无会话、无留存：一个任务一次请求，请求结束一切归零。
+//
+// ★ 绑定红线（2026-10-19）：本服务强制绑定 orion_agent_cloud，无独立运行
+//   模式——鉴权只有一条路（ORION_BASE_URL 白名单 + introspect 远端校验），
+//   未配置即 503 锁死；orion 不可达时 fail-closed（401）。任何"加回本地
+//   密钥比对/免鉴权通道"的改动都等于重新打开免鉴权裸奔，禁止。
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
@@ -19,21 +24,9 @@ import { create, exec, destroy } from '../lib/sandbox.js';
 // 单实例内的并发锁：一个人用、一个任务一个沙盒，忙了直接拒绝
 let busy = false;
 
-// APP_TOKEN 未配置只警告一次，不改变鉴权行为（保持可选）
-let warnedNoToken = false;
-
 // 单命令等待上限（默认 90s，低于 BUDGET_MS 预算；只放弃等待不杀进程）
 function cmdTimeoutMs(env) {
   return clamp(Number(env.CMD_TIMEOUT_MS || 90_000), 1_000, 300_000);
-}
-
-/** 恒时比较：避免 token 校验的时序侧信道 */
-function safeEqual(a, b) {
-  const A = String(a ?? ''), B = String(b ?? '');
-  const n = Math.max(A.length, B.length);
-  let diff = A.length ^ B.length;
-  for (let i = 0; i < n; i++) diff |= (A.charCodeAt(i) || 0) ^ (B.charCodeAt(i) || 0);
-  return diff === 0;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -44,8 +37,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  * 5s 超时：introspect 挂住时快速失败，不让鉴权环节拖住整个任务。
  */
 async function orionIntrospect(env, token) {
-  const base = String(env.ORION_BASE_URL || '').replace(/\/+$/, '');
-  if (!base) return { ok: false, reason: 'ORION_BASE_URL 未配置' };
+  const base = String(env.ORION_BASE_URL || '').trim().replace(/\/+$/, '');
   try {
     const res = await fetch(`${base}/api/auth/introspect`, {
       headers: { 'x-orion-token': `Bearer ${token}` },
@@ -68,34 +60,30 @@ export async function onRequest(context) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(env) });
   if (req.method !== 'POST') return json(env, { error: '仅支持 POST /api/chat' }, 405);
 
-  // ---------- 鉴权 ----------
-  // 凭据优先级（2026-10-19 对接 orion_agent_cloud）：
-  //   载体：优先读 X-Orion-Token（EdgeOne 会把 Authorization 覆盖成平台 COS
-  //   签名，与 orion 侧同款坑），Authorization 作回退。
-  //   通道 A：凭据形如 JWT（eyJ 开头）或设备令牌（dt_ 开头）→ 调 orion
-  //           /api/auth/introspect 远端校验，200 放行。
-  //   通道 B：其余凭据 → 与 APP_TOKEN 恒时比对（独立部署通道，行为不变）。
-  //   两者都未配置 → 免鉴权放行（保持原行为），仅警告一次。
+  // ---------- 鉴权（v2：APP_TOKEN 已取消，ORION_BASE_URL 白名单制）----------
+  // 白名单机制：ORION_BASE_URL 即访问控制总开关。
+  //   已配置 → 请求必须携带有效 orion 令牌（JWT eyJ… / 设备令牌 dt_…），
+  //            经 {ORION_BASE_URL}/api/auth/introspect 远端校验，200 放行。
+  //   未配置 → 服务锁定，一律 503（无白名单不开放，杜绝免鉴权刷额度）。
+  // 载体：X-Orion-Token 优先（EdgeOne 会把 Authorization 覆盖成平台 COS
+  // 签名，与 orion 侧同款坑），Authorization 作回退。
+  const orionBase = String(env.ORION_BASE_URL || '').trim();
+  if (!orionBase) {
+    // 强制绑定：配置缺失 = 部署事故，每次都打 error 让它在线上日志可见
+    console.error('[auth] 服务锁定：ORION_BASE_URL 未配置，本服务强制绑定 orion_agent_cloud，拒绝服务');
+    return json(env, { error: 'service_locked: 未配置 ORION_BASE_URL，白名单未启用，拒绝服务' }, 503);
+  }
   const headerVal =
     req.headers?.get?.('x-orion-token') || req.headers?.get?.('authorization') || '';
   const raw = headerVal.replace(/^Bearer\s+/i, '').trim();
-  const token = env.APP_TOKEN;
-  const orionBase = String(env.ORION_BASE_URL || '').trim();
-  const looksOrion = /^eyJ/.test(raw) || raw.startsWith('dt_');
-
-  if (raw) {
-    if (looksOrion) {
-      const v = await orionIntrospect(env, raw);
-      if (!v.ok) return json(env, { error: `unauthorized (${v.reason})` }, 401);
-    } else if (token) {
-      if (!safeEqual(raw, token)) return json(env, { error: 'unauthorized' }, 401);
+  if (!raw) return json(env, { error: 'unauthorized: 缺少 orion 令牌（X-Orion-Token 头）' }, 401);
+  const v = await orionIntrospect(env, raw);
+  if (!v.ok) {
+    // orion 依赖故障（不可达/超时）是运维事件，要在日志可见；普通令牌无效是正常拒绝，不刷日志
+    if (String(v.reason || '').includes('不可达')) {
+      console.error(`[auth] orion 依赖不可达（fail-closed 拒绝）: ${v.reason}`);
     }
-    // 非 orion 形态且未配 APP_TOKEN → 免鉴权放行（保持原行为）
-  } else if (token) {
-    return json(env, { error: 'unauthorized' }, 401);
-  } else if (!warnedNoToken) {
-    warnedNoToken = true;
-    console.warn('[auth] APP_TOKEN 未配置：接口当前免鉴权，任何人可调用并消耗 Tensorlake/LLM 额度');
+    return json(env, { error: `unauthorized (${v.reason})` }, 401);
   }
 
   let body = {};

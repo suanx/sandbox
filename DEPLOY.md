@@ -53,8 +53,7 @@ edgeone pages deploy
 |---|---|
 | `TENSORLAKE_API_KEY` | cloud.tensorlake.ai 控制台拿 |
 | `LLM_API_KEY` | 你的模型服务商 API Key |
-| `APP_TOKEN` | **强烈建议配**，否则谁都能刷你的额度 |
-| `ORION_BASE_URL` | orion_agent_cloud 地址（如 `https://or.950155.xyz`）。配置后 JWT（`eyJ` 开头）/ 设备令牌（`dt_` 开头）走 orion `/api/auth/introspect` 远端校验，实现与 orion 账号体系打通 |
+| `ORION_BASE_URL` | orion_agent_cloud 地址（如 `https://or.950155.xyz`）。**白名单总开关**：配置后只有持有效 orion 令牌（JWT `eyJ` / 设备令牌 `dt_`）的请求可调用，经 `/api/auth/introspect` 远端校验；**未配置则服务锁定（一律 503）**，杜绝免鉴权刷额度 |
 
 ### LLM 相关
 
@@ -91,7 +90,7 @@ edgeone pages deploy
 ### 请求
 ```
 POST /api/chat
-authorization: Bearer <APP_TOKEN>
+x-orion-token: Bearer <orion JWT 或 dt_ 设备令牌>
 { "task": "写一个 python 脚本算斐波那契前 20 项并运行" }
 ```
 
@@ -159,17 +158,20 @@ authorization: Bearer <APP_TOKEN>
 
 ---
 
-## 九、对接 orion_agent_cloud 鉴权（2026-10-19）
+## 九、鉴权：ORION_BASE_URL 白名单制（2026-10-19 v2）
 
-tl-agent 保持独立部署，但可直接接受 orion_agent_cloud 签发的登录凭据，
-实现「orion 账号体系统一鉴权」：
+> **绑定红线**：本服务**强制绑定 orion_agent_cloud，无独立运行模式**。
+> 鉴权只有一条路（introspect 远端校验），`ORION_BASE_URL` 未配置即 503
+> 锁死，orion 不可达时 fail-closed（401）。不设任何本地密钥比对或免鉴权
+> 通道——脱离 orion 即无法使用，这是有意设计。
 
-**鉴权双通道**（服务端自动识别，无需配置切换）：
+tl-agent **不设自有密钥**（APP_TOKEN 已取消），访问控制只有一个开关
+`ORION_BASE_URL`：
 
-| 凭据形态 | 校验方式 | 前提 |
-|---|---|---|
-| JWT（`eyJ` 开头）/ 设备令牌（`dt_` 开头） | 调 orion `GET /api/auth/introspect` 远端校验（5s 超时） | 配置 `ORION_BASE_URL` |
-| 其它任意字符串 | 与 `APP_TOKEN` 恒时比对（原有行为，不变） | 配置 `APP_TOKEN` |
+| ORION_BASE_URL | 行为 |
+|---|---|
+| 已配置 | 请求必须携带有效 orion 令牌（JWT `eyJ` / 设备令牌 `dt_`），服务端调 orion `GET /api/auth/introspect` 远端校验（5s 超时），200 放行 |
+| 未配置 | **服务锁定，一律 503**（无白名单不开放，杜绝免鉴权刷额度） |
 
 **请求头**：客户端请同时带 `X-Orion-Token: Bearer <token>` 和
 `Authorization: Bearer <token>`（EdgeOne 会把 `Authorization` 覆盖成平台
@@ -183,3 +185,24 @@ COS 签名，`X-Orion-Token` 是可靠通道；前端 app.js 已默认双发）�
 2. `curl -H "X-Orion-Token: Bearer <token>" https://<orion>/api/auth/introspect` → 应 200
 3. tl-agent 调试台 Token 栏填同一令牌 → 任务应正常执行
 4. 填一个伪造的 `dt_xxx` → 应 401
+5. 删掉 `ORION_BASE_URL` 环境变量 → 应 503（服务锁定）
+
+---
+
+## 十、接入方式二：经 orion_agent_cloud 后端代理（2026-10-19）
+
+除客户端直连外，orion_agent_cloud 新增代理接口，App 只需一套 orion 令牌
+即可用上沙盒任务（无需感知 tl-agent 的地址与凭据）：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/sandbox/task` | orion requireAuth 后转发到本服务的 `/api/chat`，body `{task}` / `{cmd}`（可选 `maxTurns`），响应原样透传 |
+| `GET /api/sandbox/info` | 返回 `{enabled}`，App 据此显隐入口 |
+
+**orion 侧环境变量**：只需 `TL_AGENT_URL`（本服务根地址），**无需共享任何
+密钥**——orion 后端把客户端令牌原样转发，本服务再向 orion introspect 闭环
+校验（要求本服务 `ORION_BASE_URL` 指向同一 orion 实例）。上游 401/403 会被
+orion 转成 502（不误导客户端重新登录）；429/500 原样透传。
+
+**本服务零改动**：orion 后端以 `X-Orion-Token`/`Authorization: Bearer <客户端令牌>`
+调用，落入白名单 introspect 通道，与直连场景完全一致。
