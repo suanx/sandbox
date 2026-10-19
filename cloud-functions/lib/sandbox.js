@@ -16,6 +16,38 @@
 
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
+// 默认镜像：Alpine 3.20（最小化，公共镜像零构建零费用，2026-10-19 用户指定）。
+// Alpine 默认只有 root、无 tl-user/工作目录 → 用 entrypoint 在沙盒首次启动时
+// 一次性初始化（建用户/建工作目录/预装常用工具），然后 sleep infinity 常驻。
+// 初始化幂等；apk 置于 mkdir 之后（即便源不可达，工作目录也已就绪）。
+// 回滚/换镜像：配 TL_IMAGE 覆盖镜像；TL_ENTRYPOINT='0' 关闭初始化。
+const DEFAULT_IMAGE = 'docker.io/library/alpine:3.20';
+const ALPINE_ENTRYPOINT = [
+  '/bin/sh', '-c',
+  'adduser -D -s /bin/sh tl-user 2>/dev/null; '
+  + 'mkdir -p /home/tl-user/workspace && chown -R tl-user /home/tl-user; '
+  + 'apk add --no-cache python3 py3-pip curl git bash 2>/dev/null; '
+  + 'exec sleep infinity',
+];
+
+function imageOpts(env, timeoutSecs) {
+  const image = String(env.TL_IMAGE || '').trim() || DEFAULT_IMAGE;
+  let entrypoint = ALPINE_ENTRYPOINT;
+  if (String(env.TL_ENTRYPOINT ?? '').trim() === '0') entrypoint = undefined;
+  else if (env.TL_ENTRYPOINT) {
+    try { entrypoint = JSON.parse(env.TL_ENTRYPOINT); } catch { /* 配置错误时用默认 */ }
+  }
+  return {
+    apiKey: env.TENSORLAKE_API_KEY,
+    cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
+    memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
+    diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
+    timeoutSecs,
+    image,
+    ...(entrypoint ? { entrypoint } : {}),
+  };
+}
+
 // 平台 API 单次调用超时（2026-10-19 事故修复）：SDK 的 requestJson 无内置
 // 超时——TensorLake API 一旦挂住（网络/平台抖动），整个云函数会被 EdgeOne
 // 120s 强杀，客户端拿到被砍断的空流。所有直连调用必须套这层保险。
@@ -46,14 +78,7 @@ export async function create(env) {
   const apiKey = env.TENSORLAKE_API_KEY;
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
 
-  return await withTimeout(Sandbox.create({
-    apiKey,
-    cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
-    memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
-    diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
-    timeoutSecs: Number(env.TL_TIMEOUT_SECS || DEFAULTS.timeoutSecs),
-    ...(env.TL_IMAGE ? { image: env.TL_IMAGE } : {}),
-  }), '创建沙盒');
+  return await withTimeout(Sandbox.create(imageOpts(env, Number(env.TL_TIMEOUT_SECS || DEFAULTS.timeoutSecs))), '创建沙盒');
 }
 
 /**
@@ -66,14 +91,7 @@ export async function createSession(env) {
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
 
   const timeoutSecs = Number(env.SESSION_TIMEOUT_SECS || 7200);
-  return await withTimeout(Sandbox.create({
-    apiKey,
-    cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
-    memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
-    diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
-    timeoutSecs,
-    ...(env.TL_IMAGE ? { image: env.TL_IMAGE } : {}),
-  }), '创建会话沙盒');
+  return await withTimeout(Sandbox.create(imageOpts(env, timeoutSecs)), '创建会话沙盒');
 }
 
 /**
