@@ -114,6 +114,23 @@ export async function destroyById(env, sandboxId) {
   await withTimeout(client.delete(String(sandboxId)), '删除沙盒');
 }
 
+// 会话/任务的标准工作目录（镜像用户 tl-user 的家目录下，可写）。
+// / 与 /workspace 均不可写（2026-10-19 实测），exec 统一在此目录执行，
+// LLM 的相对路径文件操作因此直接可用。
+export const WORKDIR = '/home/tl-user/workspace';
+
+/**
+ * 初始化沙盒工作目录（幂等，mkdir -p）。会话沙盒在创建/接回后调用一次；
+ * 失败仅告警不抛（exec 的 working_dir 缺目录时进程会启动失败，届时错误
+ * 会经命令输出回灌 LLM 自行纠正）。
+ */
+export async function initWorkdir(sb) {
+  const out = await exec(sb, `mkdir -p ${WORKDIR}`, 15_000);
+  if (String(out).includes('执行异常') || String(out).includes('无法')) {
+    console.error(`[sandbox] 工作目录初始化异常: ${out}`);
+  }
+}
+
 /**
  * 清理孤儿沙盒：销毁命名空间内全部现存沙盒，返回销毁成功的 id 列表。
  * 自建单用户部署的前提下「现存即孤儿」——正在服务中的沙盒不会被走到
@@ -133,8 +150,10 @@ export async function destroyAll(env) {
  * 执行一条命令，返回 stdout+stderr 合并文本（失败也返回，交给 LLM 自己修）。
  * timeoutMs > 0 时加单命令等待上限：只放弃【等待】，不杀死沙盒内进程——
  * 防止挂死命令（sleep 1000 / 等 stdin）把整个请求拖穿预算。
+ * workdir：命令的工作目录（可写目录，见 WORKDIR）；不传则用镜像默认（家目录）。
  */
-export async function exec(sb, cmd, timeoutMs = 0) {
+export async function exec(sb, cmd, timeoutMs = 0, workdir) {
+  const opts = workdir ? { args: ['-lc', cmd], workingDir: workdir } : { args: ['-lc', cmd] };
   const run = async () => {
     try {
       if (typeof sb.run === 'function') {
@@ -143,7 +162,7 @@ export async function exec(sb, cmd, timeoutMs = 0) {
         // spawn 失败（旧语义/无 shell）时回退整行直传。
         let r;
         try {
-          r = await sb.run('/bin/sh', { args: ['-lc', cmd] });
+          r = await sb.run('/bin/sh', opts);
         } catch {
           r = await sb.run(cmd);
         }

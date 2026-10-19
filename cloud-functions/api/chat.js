@@ -38,7 +38,7 @@
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
-import { create, createSession, connect, exec, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
+import { create, createSession, connect, exec, initWorkdir, WORKDIR, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
 
 // 并发锁：按「执行单元」隔离——无 session 的普通任务共用 '__single__'
 // （保持原全局 busy 语义），会话任务按 session id 各自一把锁，
@@ -271,7 +271,8 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
       sb = keepAlive ? await obtainSessionSandbox(env, clientSandboxId, emit) : await create(env);
       sandboxId = keepAlive ? sb?.sandboxId ?? null : null;
       reused = keepAlive && sb?._reused === true;
-      const out = await exec(sb, directCmd, cmdMs);
+      await initWorkdir(sb);
+      const out = await exec(sb, directCmd, cmdMs, WORKDIR);
       turns.push({ i: 1, thought: '', command: directCmd, output: out });
       if (emit) {
         emit('reasoning', `$ ${directCmd}\n${truncateOut(out)}\n`);
@@ -329,6 +330,7 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
           } else {
             sb = await create(env);
           }
+          await initWorkdir(sb);
         }
       } catch (e) {
         turns.push({ i, thought: d.thought, command: d.command, output: `沙盒创建失败: ${e.message}` });
@@ -337,7 +339,7 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
       }
 
       // ③ 执行（带单命令等待上限，防挂死命令拖穿预算）
-      const output = await exec(sb, d.command, cmdMs);
+      const output = await exec(sb, d.command, cmdMs, WORKDIR);
       turns.push({ i, thought: d.thought, command: d.command, output });
       history.push({ command: d.command, output });
 
