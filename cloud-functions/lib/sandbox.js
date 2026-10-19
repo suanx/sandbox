@@ -16,6 +16,19 @@
 
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
+// 平台 API 单次调用超时（2026-10-19 事故修复）：SDK 的 requestJson 无内置
+// 超时——TensorLake API 一旦挂住（网络/平台抖动），整个云函数会被 EdgeOne
+// 120s 强杀，客户端拿到被砍断的空流。所有直连调用必须套这层保险。
+const TL_API_TIMEOUT_MS = 20_000;
+
+function withTimeout(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`${label} 超时（${TL_API_TIMEOUT_MS / 1000}s，TensorLake API 无响应）`)), TL_API_TIMEOUT_MS)),
+  ]);
+}
+
 async function _loadSdk() {
   // 内嵌 tensorlake@0.5.0（纯 HTTP/SSE 实现，无原生二进制依赖）。
   // 不要换成 npm 上的新版本——0.5.141+ 引入原生二进制绑定
@@ -33,14 +46,14 @@ export async function create(env) {
   const apiKey = env.TENSORLAKE_API_KEY;
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
 
-  return await Sandbox.create({
+  return await withTimeout(Sandbox.create({
     apiKey,
     cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
     memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
     diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
     timeoutSecs: Number(env.TL_TIMEOUT_SECS || DEFAULTS.timeoutSecs),
     ...(env.TL_IMAGE ? { image: env.TL_IMAGE } : {}),
-  });
+  }), '创建沙盒');
 }
 
 /**
@@ -53,15 +66,14 @@ export async function createSession(env) {
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
 
   const timeoutSecs = Number(env.SESSION_TIMEOUT_SECS || 7200);
-  const sb = await Sandbox.create({
+  return await withTimeout(Sandbox.create({
     apiKey,
     cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
     memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
     diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
     timeoutSecs,
     ...(env.TL_IMAGE ? { image: env.TL_IMAGE } : {}),
-  });
-  return sb;
+  }), '创建会话沙盒');
 }
 
 /**
@@ -72,7 +84,7 @@ export async function connect(env, sandboxId) {
   const Sandbox = await _loadSdk();
   const apiKey = env.TENSORLAKE_API_KEY;
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
-  return await Sandbox.connect({ apiKey, sandboxId: String(sandboxId) });
+  return await withTimeout(Sandbox.connect({ apiKey, sandboxId: String(sandboxId) }), '接回会话沙盒');
 }
 
 /**
@@ -88,7 +100,7 @@ export async function listAll(env) {
   const apiKey = env.TENSORLAKE_API_KEY;
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
   const client = new SandboxClient({ apiKey }, true);
-  return await client.list();
+  return await withTimeout(client.list(), '列出沙盒');
 }
 
 /** 按 id 直接删除沙盒（走平台 DELETE，无需 connect 建隧道，轻量）。 */
@@ -99,7 +111,7 @@ export async function destroyById(env, sandboxId) {
   const apiKey = env.TENSORLAKE_API_KEY;
   if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
   const client = new SandboxClient({ apiKey }, true);
-  await client.delete(String(sandboxId));
+  await withTimeout(client.delete(String(sandboxId)), '删除沙盒');
 }
 
 /**
@@ -175,14 +187,14 @@ const DESTROY_FNS = ['terminate', 'kill', 'stop', 'close'];
 export async function destroy(sb) {
   for (const fn of DESTROY_FNS) {
     if (typeof sb[fn] === 'function') {
-      try { await sb[fn](); return; } catch (e) { console.error(`[sandbox] ${fn}() 失败: ${e?.message ?? e}`); }
+      try { await withTimeout(sb[fn](), `销毁沙盒(${fn})`); return; } catch (e) { console.error(`[sandbox] ${fn}() 失败: ${e?.message ?? e}`); }
     }
   }
   console.error('[sandbox] 首轮销毁全部失败，3s 后重试一轮');
   await new Promise(r => setTimeout(r, 3000));
   for (const fn of DESTROY_FNS) {
     if (typeof sb[fn] === 'function') {
-      try { await sb[fn](); console.log('[sandbox] 重试销毁成功'); return; } catch { /* 继续下一个 */ }
+      try { await withTimeout(sb[fn](), `销毁沙盒重试(${fn})`); console.log('[sandbox] 重试销毁成功'); return; } catch { /* 继续下一个 */ }
     }
   }
   console.error('[sandbox] 销毁彻底失败，沙盒将按 TL_TIMEOUT_SECS 兜底回收（可能产生少量费用）');

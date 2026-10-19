@@ -166,7 +166,12 @@ export async function onRequest(context) {
     if (wantStream) {
       return streamResponse(env, async (send) => {
         try {
-          const r = await runTaskLoop(env, {
+          // ★ 流级看门狗（2026-10-19）：沙盒/平台 API 若卡住（已全部加 20s
+          //   超时，此处再兜底），必须在 EdgeOne 120s 平台强杀【之前】发可
+          //   解析的 error 帧正常关流——被强杀的流客户端只能看到静默 EOF，
+          //   表现为「沙盒未返回内容」这类无根因报错。
+          const WATCHDOG_MS = clamp(Number(env.STREAM_WATCHDOG_MS || 100_000), 30_000, 115_000);
+          const loop = runTaskLoop(env, {
             task, directCmd, maxTurns, budgetMs, cmdMs,
             keepAlive, clientSandboxId,
             emit: (kind, text) => {
@@ -175,7 +180,22 @@ export async function onRequest(context) {
                 ? { choices: [{ delta: { reasoning_content: text } }] }
                 : { choices: [{ delta: { content: text } }] });
             },
-          });
+          }).then(
+            (r) => ({ ok: true, r }),
+            (e) => ({ ok: false, e }),
+          );
+          const outcome = await Promise.race([
+            loop,
+            new Promise((res) => setTimeout(() => res({ watchdog: true }), WATCHDOG_MS)),
+          ]);
+          if (outcome.watchdog) {
+            console.error('[stream] 看门狗超时，主动关流');
+            send({ error: { message: `沙盒任务看门狗超时（${Math.round(WATCHDOG_MS / 1000)}s）：任务卡在沙盒操作上已中止；沙盒将在 2h 上限自动回收，请稍后重试` } });
+            send({ choices: [{ delta: {}, finish_reason: 'watchdog' }] });
+            return;
+          }
+          if (!outcome.ok) throw outcome.e;
+          const r = outcome.r;
           // 会话元数据帧（客户端据此记住 sandboxId 供下次复用；
           // 无 choices 字段，OpenAI 通用解析器天然跳过）
           if (r.sandboxId) send({ sandbox_session: { id: r.sandboxId, reused: r.reused === true } });
