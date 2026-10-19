@@ -38,7 +38,7 @@
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
-import { create, createSession, connect, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
+import { create, createSession, connect, exec, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
 
 // 并发锁：按「执行单元」隔离——无 session 的普通任务共用 '__single__'
 // （保持原全局 busy 语义），会话任务按 session id 各自一把锁，
