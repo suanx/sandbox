@@ -12,6 +12,17 @@
 //      结束帧 [DONE]；意外异常推 {"error":{...}} 帧后收尾。
 //      流前错误（鉴权/busy）仍是普通 JSON 状态码，Dio/客户端照常处理。
 //
+// 会话模式（2026-10-19 方案 A，服务端零状态）：
+//   body 增 { session?, sandboxId?, end? }。
+//   - sandboxId 是上次响应回传的复用凭据：connect 附着已有沙盒，文件系统/
+//     已装依赖延续；失效（2h 上限被平台回收）自动回落新建，对用户无感。
+//   - 任务结束默认【不销毁不挂起】——沙盒保持 running 到 2h 上限由平台
+//     自动回收（Free 层免费；不产生任何快照）。SESSION_SUSPEND=1 可选
+//     启用挂起（付费层省钱）。
+//   - 响应回传 sandboxId（JSON 字段 / SSE 的 sandbox_session 元数据帧），
+//     客户端保管、每次请求带回；end:true + sandboxId 主动销毁。
+//   - 并发锁按 session 隔离：不同会话可并发，普通任务仍全局互斥。
+//
 // 流程（关键：第一轮 LLM 调用在建沙盒【之前】——省掉一次思考时间的沙盒空转）：
 //
 //   LLM 决定第一条命令
@@ -20,8 +31,6 @@
 //        ↓
 //   任务结束 / 超时 / 出错 → 立刻 terminate（finally 保证）
 //
-// 无 KV、无会话、无留存：一个任务一次请求，请求结束一切归零。
-//
 // ★ 绑定红线（2026-10-19）：本服务强制绑定 orion_agent_cloud，无独立运行
 //   模式——鉴权只有一条路（ORION_BASE_URL 白名单 + introspect 远端校验），
 //   未配置即 503 锁死；orion 不可达时 fail-closed（401）。任何"加回本地
@@ -29,10 +38,12 @@
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
-import { create, exec, destroy } from '../lib/sandbox.js';
+import { create, createSession, connect, suspendSafe, resumeSafe, destroy } from '../lib/sandbox.js';
 
-// 单实例内的并发锁：一个人用、一个任务一个沙盒，忙了直接拒绝
-let busy = false;
+// 并发锁：按「执行单元」隔离——无 session 的普通任务共用 '__single__'
+// （保持原全局 busy 语义），会话任务按 session id 各自一把锁，
+// 不同会话可并发（各自独立沙盒，互不阻塞）。
+const busyLocks = new Set();
 
 // 单命令等待上限（默认 90s，低于 BUDGET_MS 预算；只放弃等待不杀进程）
 function cmdTimeoutMs(env) {
@@ -102,10 +113,37 @@ export async function onRequest(context) {
   // 兼容两种叫法：task（新） / cmd（旧，直接当命令跑）
   const task = String(body.task ?? '').trim();
   const directCmd = String(body.cmd ?? '').trim();
+
+  // 会话模式（2026-10-19 方案 A）：客户端持 sandboxId 作为会话令牌。
+  //   session    会话标识（App 按聊天会话生成，仅作并发锁粒度用）
+  //   sandboxId  上一次响应回传的沙盒 id（复用凭据；首次请求没有）
+  //   end:true   结束会话 → 销毁沙盒
+  // 服务端零状态：无 KV、无 name 留存；沙盒保持 running 到
+  // SESSION_TIMEOUT_SECS（默认 2h）由平台自动回收，不产生快照。
+  const session = String(body.session ?? '').slice(0, 80);
+  const clientSandboxId = String(body.sandboxId ?? '').slice(0, 120);
+  const endSession = body.end === true;
+  const keepAlive = Boolean(session || clientSandboxId);
+
+  // end 模式：销毁会话沙盒即刻返回（不需要 task）
+  if (endSession && clientSandboxId) {
+    try {
+      const sb = await connect(env, clientSandboxId);
+      await destroy(sb);
+      return json(env, { finish: 'ended', sandboxId: clientSandboxId });
+    } catch (e) {
+      // 沙盒已不存在/已回收：会话本来就该算结束了
+      return json(env, { finish: 'ended', sandboxId: clientSandboxId, note: '沙盒已不存在（可能已超时回收）' });
+    }
+  }
+
   if (!task && !directCmd) { return json(env, { error: 'task 不能为空' }, 400); }
 
-  if (busy) return json(env, { error: 'busy: 上一个任务还在跑' }, 429);
-  busy = true;
+  // 并发锁按「执行单元」：无 session 共用 '__single__'（原全局 busy 语义），
+  // 会话任务按 session id 各一把锁（不同会话独立沙盒，互不阻塞）。
+  const lockKey = session || '__single__';
+  if (busyLocks.has(lockKey)) return json(env, { error: 'busy: 上一个任务还在跑' }, 429);
+  busyLocks.add(lockKey);
 
   const maxTurns = clamp(Number(env.MAX_TURNS || body.maxTurns || 8), 1, 20);
   const budgetMs = clamp(Number(env.BUDGET_MS || 110_000), 10_000, 600_000);
@@ -121,6 +159,7 @@ export async function onRequest(context) {
         try {
           const r = await runTaskLoop(env, {
             task, directCmd, maxTurns, budgetMs, cmdMs,
+            keepAlive, clientSandboxId,
             emit: (kind, text) => {
               if (!text) return;
               send(kind === 'reasoning'
@@ -128,6 +167,9 @@ export async function onRequest(context) {
                 : { choices: [{ delta: { content: text } }] });
             },
           });
+          // 会话元数据帧（客户端据此记住 sandboxId 供下次复用；
+          // 无 choices 字段，OpenAI 通用解析器天然跳过）
+          if (r.sandboxId) send({ sandbox_session: { id: r.sandboxId, reused: r.reused === true } });
           // 结论补推：过程（思考/命令）走了 reasoning 通道，正文目前还是空的。
           // answer 分段推送制造打字感——与 forge 的逐字流体验对齐。
           if (r.answer) {
@@ -144,22 +186,25 @@ export async function onRequest(context) {
           send({ error: { message: `沙盒任务异常: ${String(e?.message ?? e).slice(0, 300)}` } });
           send({ choices: [{ delta: {}, finish_reason: 'error' }] });
         } finally {
-          // ★ busy 锁必须在流结束（沙盒销毁）后才释放——Response 先于任务
+          // ★ busy 锁必须在流结束（沙盒收尾）后才释放——Response 先于任务
           //   返回，外层 finally 在任务还跑着时就执行了，不能放那里。
-          busy = false;
+          busyLocks.delete(lockKey);
         }
       });
     }
 
-    // ---------- JSON 模式（原 v3 行为，一字未动语义） ----------
-    const r = await runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, emit: null });
-    busy = false;
+    // ---------- JSON 模式（v3 行为 + 会话字段） ----------
+    const r = await runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, keepAlive, clientSandboxId, emit: null });
+    busyLocks.delete(lockKey);
     if (r.error) {
       return json(env, { answer: '', turns: r.turns, finish: 'error', error: r.error, ms: r.ms }, 500);
     }
-    return json(env, { answer: r.answer, turns: r.turns, finish: r.finish, ms: r.ms });
+    return json(env, {
+      answer: r.answer, turns: r.turns, finish: r.finish, ms: r.ms,
+      ...(r.sandboxId ? { sandboxId: r.sandboxId, reused: r.reused === true } : {}),
+    });
   } catch (e) {
-    busy = false;
+    busyLocks.delete(lockKey);
     throw e;
   }
 }
@@ -173,19 +218,24 @@ export async function onRequest(context) {
  * 'content' 正文）；JSON 模式传 null，只收集不推送。
  * 沙盒的销毁在本函数 finally 保证；busy 锁由调用方管理。
  */
-async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, emit }) {
+async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, emit, keepAlive, clientSandboxId }) {
   const t0 = Date.now();
   const deadline = t0 + budgetMs;
   const turns = [];
   const history = [];
   let sb = null;
+  let sandboxId = null; // 会话模式回传给客户端的复用凭据
+  let reused = false;
   let answer = '';
   let finish = 'done';
 
   try {
     // ---------- 直接命令模式（不走 LLM，方便调试沙盒） ----------
+    // 会话模式下同样可用：复用/创建会话沙盒跑直通命令，跑完不销毁。
     if (!task && directCmd) {
-      sb = await create(env);
+      sb = keepAlive ? await obtainSessionSandbox(env, clientSandboxId, emit) : await create(env);
+      sandboxId = keepAlive ? sb?.sandboxId ?? null : null;
+      reused = keepAlive && sb?._reused === true;
       const out = await exec(sb, directCmd, cmdMs);
       turns.push({ i: 1, thought: '', command: directCmd, output: out });
       if (emit) {
@@ -193,7 +243,7 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
       } else {
         answer = out;
       }
-      return { answer: answer || out, turns, finish: 'done', ms: Date.now() - t0 };
+      return { answer: answer || out, turns, finish: 'done', ms: Date.now() - t0, sandboxId, reused };
     }
 
     // ---------- 多轮自主循环 ----------
@@ -233,9 +283,18 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
         break;
       }
 
-      // ② 第一条命令出来了才建沙盒
+      // ② 第一条命令出来了才准备沙盒（省钱：LLM 思考期间不占用）
+      //    会话模式：先尝试复用客户端带来的 sandboxId，失败回落新建。
       try {
-        if (!sb) sb = await create(env);
+        if (!sb) {
+          if (keepAlive) {
+            sb = await obtainSessionSandbox(env, clientSandboxId, emit);
+            sandboxId = sb?.sandboxId ?? null;
+            reused = sb?._reused === true;
+          } else {
+            sb = await create(env);
+          }
+        }
       } catch (e) {
         turns.push({ i, thought: d.thought, command: d.command, output: `沙盒创建失败: ${e.message}` });
         finish = 'sandbox_error';
@@ -263,14 +322,48 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
     }
     if (finish === 'done' && turns.length >= maxTurns) finish = 'max_turns';
 
-    return { answer, turns, finish, ms: Date.now() - t0 };
+    return { answer, turns, finish, ms: Date.now() - t0, sandboxId, reused };
   } catch (e) {
     // 兜底：JSON 模式走 500；SSE 模式由调用方的 error 帧承接
     return { answer: '', turns, finish: 'error', error: String(e?.message ?? e), ms: Date.now() - t0 };
   } finally {
-    // ★ 铁律：无论如何销毁
-    if (sb) await destroy(sb);
+    // ★ 收尾铁律：
+    //   普通任务（无会话）→ 无论成败必销毁（防烧钱）；
+    //   会话任务 → **不销毁不挂起**（用户明确不要快照）：沙盒保持 running，
+    //   由 SESSION_TIMEOUT_SECS（默认 2h）到点平台自动回收——2h 内客户端
+    //   可随时凭 sandboxId 复用；suspend 仅在 SESSION_SUSPEND=1 时启用
+    //   （付费层省钱选项）。
+    //   沙盒创建失败时 sb 为 null，无需收尾。
+    if (sb) {
+      if (keepAlive && sandboxId) {
+        if (String(env.SESSION_SUSPEND || '') === '1') await suspendSafe(sb);
+        // 默认：什么都不做，保持 running
+      } else {
+        await destroy(sb);
+      }
+    }
   }
+}
+
+/**
+ * 会话沙盒获取：connect 客户端凭据 → 失败（已回收/不存在）回落新建。
+ * 返回的句柄带 _reused 标记与 sandboxId，供响应回传客户端。
+ */
+async function obtainSessionSandbox(env, clientSandboxId, emit) {
+  if (clientSandboxId) {
+    try {
+      const sb = await connect(env, clientSandboxId);
+      sb._reused = true;
+      if (emit) emit('reasoning', `（已接回会话沙盒，环境与文件延续）\n`);
+      return sb;
+    } catch (e) {
+      // 沙盒已被 2h 上限回收 / id 失效：静默回落新建（对用户无感）
+      if (emit) emit('reasoning', `（原会话沙盒已失效，开新沙盒继续）\n`);
+    }
+  }
+  const sb = await createSession(env);
+  if (emit) emit('reasoning', `（已创建会话沙盒，2 小时内环境持续可用）\n`);
+  return sb;
 }
 
 // ---------- helpers ----------
