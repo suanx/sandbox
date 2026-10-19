@@ -76,23 +76,45 @@ export async function connect(env, sandboxId) {
 }
 
 /**
- * 挂起会话沙盒（任务间歇）：内存快照落盘，此后只收 storage 费；
- * 下次 connect 后 resume() 即可恢复文件系统与依赖。失败不打断主流程
- * （最坏情况：沙盒保持 running 烧到 timeoutSecs 自动回收）。
+ * 列出命名空间内全部沙盒（running/suspended）。
+ * 用途：孤儿沙盒清理（Free 层并发 1，App 丢失 sandboxId 后遗留的
+ * running 沙盒会占掉唯一并发名额，2h 内无法创建新沙盒）。
+ * 返回 [{sandboxId, status, ...}]。
  */
-export async function suspendSafe(sb) {
-  if (!sb || typeof sb.suspend !== 'function') return;
-  try { await sb.suspend(); } catch (e) {
-    console.error(`[sandbox] suspend 失败（沙盒将烧到超时自动回收）: ${e?.message ?? e}`);
-  }
+export async function listAll(env) {
+  const mod = await import('./tensorlake-0.5.0-patched.mjs');
+  const SandboxClient = mod.SandboxClient;
+  if (!SandboxClient) throw new Error('tensorlake: 未找到 SandboxClient 导出');
+  const apiKey = env.TENSORLAKE_API_KEY;
+  if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
+  const client = new SandboxClient({ apiKey }, true);
+  return await client.list();
+}
+
+/** 按 id 直接删除沙盒（走平台 DELETE，无需 connect 建隧道，轻量）。 */
+export async function destroyById(env, sandboxId) {
+  const mod = await import('./tensorlake-0.5.0-patched.mjs');
+  const SandboxClient = mod.SandboxClient;
+  if (!SandboxClient) throw new Error('tensorlake: 未找到 SandboxClient 导出');
+  const apiKey = env.TENSORLAKE_API_KEY;
+  if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
+  const client = new SandboxClient({ apiKey }, true);
+  await client.delete(String(sandboxId));
 }
 
 /**
- * 恢复挂起的会话沙盒；已在 running 态时 resume 报错也无妨（幂等处理）。
+ * 清理孤儿沙盒：销毁命名空间内全部现存沙盒，返回销毁成功的 id 列表。
+ * 自建单用户部署的前提下「现存即孤儿」——正在服务中的沙盒不会被走到
+ * 这里（客户端持有其 sandboxId，走 connect 复用路径）。
  */
-export async function resumeSafe(sb) {
-  if (!sb || typeof sb.resume !== 'function') return;
-  try { await sb.resume(); } catch { /* running 态 resume 会报错，忽略 */ }
+export async function destroyAll(env) {
+  const all = await listAll(env);
+  const killed = [];
+  for (const s of all ?? []) {
+    if (!s?.sandboxId) continue;
+    try { await destroyById(env, s.sandboxId); killed.push(s.sandboxId); } catch { /* 单个失败不阻断 */ }
+  }
+  return killed;
 }
 
 /**
@@ -171,4 +193,22 @@ function join(out, err) {
   const e = String(err ?? '').trim();
   if (o && e) return `${o}\n[stderr] ${e}`;
   return o || e || '(无输出)';
+}
+
+/**
+ * 挂起会话沙盒（任务间歇，可选：SESSION_SUSPEND=1 时启用）：内存快照落盘，
+ * 此后只收 storage 费；下次 connect 后 resume() 恢复文件系统与依赖。
+ * 失败不打断主流程（最坏情况：沙盒保持 running 烧到 timeoutSecs 自动回收）。
+ */
+export async function suspendSafe(sb) {
+  if (!sb || typeof sb.suspend !== 'function') return;
+  try { await sb.suspend(); } catch (e) {
+    console.error(`[sandbox] suspend 失败（沙盒将烧到超时自动回收）: ${e?.message ?? e}`);
+  }
+}
+
+/** 恢复挂起的会话沙盒；已在 running 态时 resume 报错也无妨（幂等处理）。 */
+export async function resumeSafe(sb) {
+  if (!sb || typeof sb.resume !== 'function') return;
+  try { await sb.resume(); } catch { /* running 态 resume 会报错，忽略 */ }
 }

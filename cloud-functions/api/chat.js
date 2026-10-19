@@ -38,7 +38,7 @@
 // ============================================================================
 
 import { decide } from '../lib/llm.js';
-import { create, createSession, connect, suspendSafe, resumeSafe, destroy } from '../lib/sandbox.js';
+import { create, createSession, connect, suspendSafe, resumeSafe, destroy, destroyAll } from '../lib/sandbox.js';
 
 // 并发锁：按「执行单元」隔离——无 session 的普通任务共用 '__single__'
 // （保持原全局 busy 语义），会话任务按 session id 各自一把锁，
@@ -135,6 +135,15 @@ export async function onRequest(context) {
       // 沙盒已不存在/已回收：会话本来就该算结束了
       return json(env, { finish: 'ended', sandboxId: clientSandboxId, note: '沙盒已不存在（可能已超时回收）' });
     }
+  }
+
+  // cleanup 模式：销毁命名空间内全部遗留沙盒（孤儿清理；Free 并发 1 被占
+  // 时的手动兜底，也供调度/运维脚本调用）。可与 end 同时省略其它字段。
+  if (body.cleanup === true) {
+    let killed = [];
+    let err = '';
+    try { killed = await destroyAll(env); } catch (e) { err = String(e?.message ?? e); }
+    return json(env, { finish: 'cleaned', killed, ...(err ? { error: err } : {}) });
   }
 
   if (!task && !directCmd) { return json(env, { error: 'task 不能为空' }, 400); }
@@ -358,6 +367,8 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
 
 /**
  * 会话沙盒获取：connect 客户端凭据 → 失败（已回收/不存在）回落新建。
+ * 新建撞上并发配额（Free 层并发 1，遗留孤儿沙盒占位——App 丢失 id/跨端
+ * 场景）时自动清理全部遗留沙盒后重试一次（自建单用户，现存即孤儿）。
  * 返回的句柄带 _reused 标记与 sandboxId，供响应回传客户端。
  */
 async function obtainSessionSandbox(env, clientSandboxId, emit) {
@@ -372,9 +383,24 @@ async function obtainSessionSandbox(env, clientSandboxId, emit) {
       if (emit) emit('reasoning', `（原会话沙盒已失效，开新沙盒继续）\n`);
     }
   }
-  const sb = await createSession(env);
-  if (emit) emit('reasoning', `（已创建会话沙盒，2 小时内环境持续可用）\n`);
-  return sb;
+  try {
+    const sb = await createSession(env);
+    if (emit) emit('reasoning', `（已创建会话沙盒，2 小时内环境持续可用）\n`);
+    return sb;
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    if (!/quota|running|concurrency/i.test(msg)) throw e;
+    // 并发配额被占：清掉遗留沙盒（含本请求无法得知 id 的孤儿）后重试一次
+    if (emit) emit('reasoning', `（并发配额被遗留沙盒占用，自动清理后重试…）\n`);
+    let killed = [];
+    try { killed = await destroyAll(env); } catch { /* 清理失败则按原错误抛出 */ }
+    if (emit) emit('reasoning', killed.length
+      ? `（已清理 ${killed.length} 个遗留沙盒，重新创建）\n`
+      : `（未发现可清理的沙盒，直接重试创建）\n`);
+    const sb = await createSession(env);
+    if (emit) emit('reasoning', `（已创建会话沙盒，2 小时内环境持续可用）\n`);
+    return sb;
+  }
 }
 
 // ---------- helpers ----------
