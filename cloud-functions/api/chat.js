@@ -196,6 +196,12 @@ export async function onRequest(context) {
           }
           if (!outcome.ok) throw outcome.e;
           const r = outcome.r;
+          // 顶层意外异常（finish=error）的原因必须透出——否则用户只看到
+          // 「未返回内容」，无法定位（2026-10-19 诊断实证）
+          if (r.error) {
+            console.error(`[stream] 任务失败: ${r.error}`);
+            send({ error: { message: `沙盒任务异常: ${String(r.error).slice(0, 300)}` } });
+          }
           // 会话元数据帧（客户端据此记住 sandboxId 供下次复用；
           // 无 choices 字段，OpenAI 通用解析器天然跳过）
           if (r.sandboxId) send({ sandbox_session: { id: r.sandboxId, reused: r.reused === true } });
