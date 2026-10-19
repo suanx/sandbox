@@ -314,11 +314,22 @@ async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, em
     }
 
     if (!answer) {
-      answer = finish === 'timeout'
-        ? `已达时间预算（${Math.round(budgetMs / 1000)}s），未完成。已执行 ${turns.length} 步。`
-        : finish === 'max_turns'
-          ? `已达最大轮数 ${maxTurns}，未完成。`
-          : '任务结束，未给出明确结论。';
+      // 失败原因透出（2026-10-19）：sandbox_error / llm_error / parse_error
+      // 的真实错误在 turns 里，App 不展示 turns——之前全被「任务结束，未给
+      // 出明确结论」掩盖，用户看不到「TENSORLAKE_API_KEY 未配置」这类根因。
+      const lastOutput = turns.length ? String(turns[turns.length - 1]?.output ?? '') : '';
+      if (finish === 'sandbox_error') {
+        answer = `沙盒创建/执行失败：${lastOutput || '原因未知，请稍后重试'}`;
+      } else if (finish === 'llm_error') {
+        const t = turns.length ? String(turns[turns.length - 1]?.thought ?? '') : '';
+        answer = `沙盒侧模型调用失败：${t || '请检查沙盒服务的 LLM 配置'}`;
+      } else if (finish === 'parse_error') {
+        answer = '沙盒侧模型输出无法解析，已终止。请重试或换更明确的任务描述。';
+      } else if (finish === 'timeout') {
+        answer = `已达时间预算（${Math.round(budgetMs / 1000)}s），未完成。已执行 ${turns.length} 步。`;
+      } else {
+        answer = `已达最大轮数 ${maxTurns}，未完成。`;
+      }
     }
     if (finish === 'done' && turns.length >= maxTurns) finish = 'max_turns';
 
