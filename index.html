@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Tensorlake · AI 任务执行器</title>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div class="shell">
+  <header class="top">
+    <div class="brand">
+      <span class="dot"></span>TENSORLAKE<span class="sep">×</span>AI
+      <span class="sub">自主任务执行器</span>
+    </div>
+    <div class="stats">
+      <span class="chip" id="statChip">空闲</span>
+      <span class="chip" id="turnChip">0 步</span>
+    </div>
+  </header>
+
+  <section class="pane" id="log"></section>
+
+  <footer class="bar">
+    <span class="prompt">❯</span>
+    <input id="task" placeholder="描述任务，例如：写一个 python 脚本计算斐波那契前 20 项并运行" autocomplete="off" spellcheck="false"/>
+    <button id="send">执行</button>
+    <button id="stop" class="stop" disabled>停止</button>
+  </footer>
+
+  <div class="cfg">
+    <span>Endpoint</span>
+    <input id="ep" value="https://your-project.edgeone.app/api/chat" spellcheck="false"/>
+    <span>Token</span>
+    <input id="tk" type="password" placeholder="APP_TOKEN"/>
+    <button id="save" class="tiny">保存</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
