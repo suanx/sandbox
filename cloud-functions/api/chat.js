@@ -2,6 +2,16 @@
 // AI 自主任务执行器
 // POST /api/chat   body: { "task": "用 python 分析..." }
 //
+// 两种响应模式（2026-10-19 v4 流式化）：
+//   ① JSON（默认）：一次性返回 {answer, turns, finish, ms}——旧客户端兼容；
+//   ② SSE（body.stream === true 或 Accept: text/event-stream）：
+//      OpenAI delta 兼容流，边跑边推——
+//        thought（思考）        → delta.reasoning_content（App 思考面板）
+//        命令 + 执行输出（过程） → delta.reasoning_content
+//        最终 answer（结论）    → delta.content（正文，分段推送有打字感）
+//      结束帧 [DONE]；意外异常推 {"error":{...}} 帧后收尾。
+//      流前错误（鉴权/busy）仍是普通 JSON 状态码，Dio/客户端照常处理。
+//
 // 流程（关键：第一轮 LLM 调用在建沙盒【之前】——省掉一次思考时间的沙盒空转）：
 //
 //   LLM 决定第一条命令
@@ -101,6 +111,69 @@ export async function onRequest(context) {
   const budgetMs = clamp(Number(env.BUDGET_MS || 110_000), 10_000, 600_000);
   const cmdMs = cmdTimeoutMs(env);
 
+  // SSE 模式判定：显式 stream:true 优先，Accept 头兜底。
+  const wantStream = body.stream === true ||
+      String(req.headers?.get?.('accept') || '').includes('text/event-stream');
+
+  try {
+    if (wantStream) {
+      return streamResponse(env, async (send) => {
+        try {
+          const r = await runTaskLoop(env, {
+            task, directCmd, maxTurns, budgetMs, cmdMs,
+            emit: (kind, text) => {
+              if (!text) return;
+              send(kind === 'reasoning'
+                ? { choices: [{ delta: { reasoning_content: text } }] }
+                : { choices: [{ delta: { content: text } }] });
+            },
+          });
+          // 结论补推：过程（思考/命令）走了 reasoning 通道，正文目前还是空的。
+          // answer 分段推送制造打字感——与 forge 的逐字流体验对齐。
+          if (r.answer) {
+            for (const chunk of chunkText(r.answer, 120)) {
+              send({ choices: [{ delta: { content: chunk } }] });
+              await sleep(15);
+            }
+          }
+          // OpenAI 风格收尾帧：done → stop，其余 finish 原因透出（诊断用）
+          send({ choices: [{ delta: {}, finish_reason: r.finish === 'done' ? 'stop' : r.finish }] });
+        } catch (e) {
+          // 循环外层意外异常：error 帧（客户端据此给明确报错），再正常收尾
+          console.error(`[stream] 任务异常: ${e?.message ?? e}`);
+          send({ error: { message: `沙盒任务异常: ${String(e?.message ?? e).slice(0, 300)}` } });
+          send({ choices: [{ delta: {}, finish_reason: 'error' }] });
+        } finally {
+          // ★ busy 锁必须在流结束（沙盒销毁）后才释放——Response 先于任务
+          //   返回，外层 finally 在任务还跑着时就执行了，不能放那里。
+          busy = false;
+        }
+      });
+    }
+
+    // ---------- JSON 模式（原 v3 行为，一字未动语义） ----------
+    const r = await runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, emit: null });
+    busy = false;
+    if (r.error) {
+      return json(env, { answer: '', turns: r.turns, finish: 'error', error: r.error, ms: r.ms }, 500);
+    }
+    return json(env, { answer: r.answer, turns: r.turns, finish: r.finish, ms: r.ms });
+  } catch (e) {
+    busy = false;
+    throw e;
+  }
+}
+
+// ---------- 任务主循环（JSON / SSE 共用） ----------
+
+/**
+ * 跑一个沙盒任务，返回 {answer, turns, finish, ms[, error]}。
+ *
+ * emit(kind, text)：SSE 模式的增量出口（kind='reasoning' 思考与过程 /
+ * 'content' 正文）；JSON 模式传 null，只收集不推送。
+ * 沙盒的销毁在本函数 finally 保证；busy 锁由调用方管理。
+ */
+async function runTaskLoop(env, { task, directCmd, maxTurns, budgetMs, cmdMs, emit }) {
   const t0 = Date.now();
   const deadline = t0 + budgetMs;
   const turns = [];
@@ -114,10 +187,13 @@ export async function onRequest(context) {
     if (!task && directCmd) {
       sb = await create(env);
       const out = await exec(sb, directCmd, cmdMs);
-      return json(env, {
-        answer: out, turns: [{ i: 1, thought: '', command: directCmd, output: out }],
-        finish: 'done', ms: Date.now() - t0,
-      });
+      turns.push({ i: 1, thought: '', command: directCmd, output: out });
+      if (emit) {
+        emit('reasoning', `$ ${directCmd}\n${truncateOut(out)}\n`);
+      } else {
+        answer = out;
+      }
+      return { answer: answer || out, turns, finish: 'done', ms: Date.now() - t0 };
     }
 
     // ---------- 多轮自主循环 ----------
@@ -148,6 +224,9 @@ export async function onRequest(context) {
         break;
       }
 
+      // ★ 流式：思考（含轮次标记）走 reasoning 通道，与 forge 的思考面板同构
+      if (emit && d.thought) emit('reasoning', `【第 ${i} 轮】${d.thought}\n`);
+
       if (d.done || !d.command) {
         answer = d.answer || d.thought || '任务完成';
         finish = 'done';
@@ -168,6 +247,9 @@ export async function onRequest(context) {
       turns.push({ i, thought: d.thought, command: d.command, output });
       history.push({ command: d.command, output });
 
+      // ★ 流式：命令与输出是任务过程，走 reasoning 通道（正文只留最终结论）
+      if (emit) emit('reasoning', `$ ${d.command}\n${truncateOut(output)}\n\n`);
+
       // 再检查一次预算，避免执行完已超时还在继续
       if (Date.now() > deadline) { finish = 'timeout'; break; }
     }
@@ -181,16 +263,13 @@ export async function onRequest(context) {
     }
     if (finish === 'done' && turns.length >= maxTurns) finish = 'max_turns';
 
-    return json(env, { answer, turns, finish, ms: Date.now() - t0 });
+    return { answer, turns, finish, ms: Date.now() - t0 };
   } catch (e) {
-    return json(env, {
-      answer: '', turns, finish: 'error',
-      error: String(e?.message ?? e), ms: Date.now() - t0,
-    }, 500);
+    // 兜底：JSON 模式走 500；SSE 模式由调用方的 error 帧承接
+    return { answer: '', turns, finish: 'error', error: String(e?.message ?? e), ms: Date.now() - t0 };
   } finally {
     // ★ 铁律：无论如何销毁
     if (sb) await destroy(sb);
-    busy = false;
   }
 }
 
@@ -200,6 +279,7 @@ function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, Number.isFinite(n) 
 function json(env, data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: h(env) });
 }
+
 function h(env) {
   return {
     'content-type': 'application/json',
@@ -209,6 +289,7 @@ function h(env) {
     'access-control-allow-headers': 'content-type,authorization,x-orion-token',
   };
 }
+
 function cors(env) {
   return {
     'access-control-allow-origin': env.APP_ORIGIN || '*',
@@ -216,4 +297,48 @@ function cors(env) {
     'access-control-allow-headers': 'content-type,authorization,x-orion-token',
     'access-control-max-age': '86400',
   };
+}
+
+/**
+ * SSE 流式响应：ReadableStream + 逐帧 enqueue。
+ * EdgeOne 云函数支持流式 Response（forge /agent/chat SSE 同环境已验证）。
+ * send() 必须在 start 回调内同步/await 使用；finally 关流。
+ */
+function streamResponse(env, run) {
+  const enc = new TextEncoder();
+  return new Response(new ReadableStream({
+    async start(ctrl) {
+      const send = (obj) => ctrl.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      try {
+        await run(send);
+      } finally {
+        try { ctrl.enqueue(enc.encode('data: [DONE]\n\n')); } catch { /* 流已坏 */ }
+        try { ctrl.close(); } catch { /* 已关 */ }
+      }
+    },
+  }), {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-accel-buffering': 'no',
+      'access-control-allow-origin': env.APP_ORIGIN || '*',
+      'access-control-allow-methods': 'POST,OPTIONS',
+      'access-control-allow-headers': 'content-type,authorization,x-orion-token',
+    },
+  });
+}
+
+/** 把最终 answer 按 ~n 字符切段（伪流式，段间 sleep 由调用方控制）。 */
+function chunkText(s, n) {
+  const t = String(s ?? '');
+  const out = [];
+  for (let i = 0; i < t.length; i += n) out.push(t.slice(i, i + n));
+  return out.length ? out : [t];
+}
+
+/** 过程输出塞思考通道前的截断（防超长输出把 reasoning 面板撑爆）。 */
+function truncateOut(s) {
+  const t = String(s ?? '');
+  return t.length > 4000 ? t.slice(0, 4000) + '\n...(输出已截断)' : t;
 }
