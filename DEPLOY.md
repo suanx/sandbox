@@ -230,3 +230,19 @@ Node ≥ 22.19**，EdgeOne 云函数是 **Node 20** 运行时，不兼容。已�
 package.json 用 `overrides` 把 undici 压到 `6.29.1`（Node ≥ 18 可用，
 SDK 仅用 Agent / fetch / setGlobalDispatcher，v6 全部支持）。
 **EdgeOne 控制台的 Node 版本升级到 22+ 前请勿移除此 overrides。**
+
+### 内嵌补丁版 SDK（2026-10-19 第三次修复，最终方案）
+
+锁定 0.5.0 后 API 又报 422：`ephemeral_disk_mb: unknown field`——现行
+Tensorlake API 已把该字段改为 `disk_mb`，而 0.5.0 是硬编码旧字段（且
+根本不读调用方的 diskMb）。0.5.140 虽用新字段但引入 grpc 依赖与
+native-worker 惰性自引用，风险大。
+
+**最终方案**：把 tensorlake 0.5.0 的 `dist/index.js`（166KB，自包含）
+内嵌为 `cloud-functions/lib/tensorlake-0.5.0-patched.mjs`，仅补丁一处：
+创建请求 `ephemeral_disk_mb` → 按调用方 `diskMb` 条件发送 `disk_mb`。
+- `lib/sandbox.js` 改为 `import('./tensorlake-0.5.0-patched.mjs')`
+- package.json 只保留 `undici@6.29.1`（精确锁定）+ `ws@^8.20.0`，
+  不再依赖 npm 上的 tensorlake 包
+- 本地冒烟：模块加载 OK，Sandbox.create 到达 API（假 key 返回 403，
+  证明请求体已过 API 校验层）

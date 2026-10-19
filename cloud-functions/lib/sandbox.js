@@ -11,7 +11,10 @@
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
 export async function create(env) {
-  const mod = await import('tensorlake');
+  // 内嵌并补丁过的 tensorlake@0.5.0（不要改回 npm 包，原因见 DEPLOY.md）：
+  // - 0.5.0 是最后一个自包含版本（新版拆为 scoped 壳包，EdgeOne 解析不了）
+  // - 补丁点仅一处：创建请求的 ephemeral_disk_mb（API 已废弃）→ disk_mb
+  const mod = await import('./tensorlake-0.5.0-patched.mjs');
   const Sandbox = mod.Sandbox ?? mod.default?.Sandbox ?? mod.default;
   if (!Sandbox) throw new Error('tensorlake: 未找到 Sandbox 导出，请检查 SDK 版本');
 
