@@ -246,3 +246,11 @@ native-worker 惰性自引用，风险大。
   不再依赖 npm 上的 tensorlake 包
 - 本地冒烟：模块加载 OK，Sandbox.create 到达 API（假 key 返回 403，
   证明请求体已过 API 校验层）
+
+### maxDuration=120（2026-10-19 第四次修复）
+
+沙盒真正开始创建后任务调用报 `CLOUD_FUNCTION_INVOCATION_TIMEOUT`：
+edgeone.json 未配置 maxDuration，平台默认 30s，而 Tensorlake 沙盒
+创建+启动可能超过 30s。已补 `cloudFunctions.nodejs.maxDuration: 120`
+（与 orion_agent_cloud 同款，实测生效前提是函数跑在 cloud-functions/
+Node runtime 而非 legacy functions/）。
