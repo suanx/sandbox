@@ -26,7 +26,10 @@ const ALPINE_ENTRYPOINT = [
   '/bin/sh', '-c',
   'adduser -D -s /bin/sh tl-user 2>/dev/null; '
   + 'mkdir -p /home/tl-user/workspace && chown -R tl-user /home/tl-user; '
-  + 'apk add --no-cache python3 py3-pip curl git bash 2>/dev/null; '
+  // 必要包一次装齐（前台阻塞，装完才标记 running）：运行时/网络/解压/编译链
+  + 'apk add --no-cache '
+  + 'bash ca-certificates tzdata curl wget git openssh-client unzip '
+  + 'python3 py3-pip nodejs npm gcc musl-dev make 2>/dev/null; '
   + 'exec sleep infinity',
 ];
 
@@ -44,7 +47,7 @@ function imageOpts(env, timeoutSecs) {
     diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
     timeoutSecs,
     image,
-    ...(entrypoint ? { entrypoint } : {}),
+    ...(entrypoint ? { entrypoint, startupTimeout: 180 } : {}),
   };
 }
 
