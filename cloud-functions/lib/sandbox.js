@@ -8,31 +8,69 @@
 //   3) ephemeral（不传 name）→ 不会 suspend 留存，零存储费
 //
 // 会话模式（2026-10-19 方案 A）：客户端持 sandboxId 作为会话令牌——
-//   connect(sandboxId) 附着已有沙盒 → resume 恢复（suspend 只收 storage 费，
-//   文件系统/已装依赖全保留）→ 用完 suspend 而非 destroy。寿命由
-//   SESSION_TIMEOUT_SECS（默认 2h）封顶，到点平台自动回收；服务端零状态，
-//   无 KV、无 name 留存。suspend 失败兜底直接 destroy（丢会话不丢钱）。
+//   connect(sandboxId) 附着已有沙盒 → 环境与文件延续 → 用完保持 running
+//   （2026-10-19 用户约束「不要快照/不要花钱」），寿命由
+//   SESSION_TIMEOUT_SECS（默认 2h）封顶由平台自动回收；服务端零状态，
+//   无 KV、无 name 留存。
+//
+// 镜像策略（2026-10-19 用户约束「没法充值 + 启动要快，工具到时候再装」）：
+//   平台默认镜像（已注册、秒级可用），不预装任何东西——LLM 在任务里按需
+//   apt 现装（进度对其可见），随沙盒 2h 生命周期归零。TL_IMAGE 可覆盖。
 // ============================================================================
 
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
-// 默认镜像：平台默认（TensorLake 服务器镜像，已注册、立即可用）。
-// 2026-10-19 用户硬约束：「没法充值，不要花钱」——不注册自定义模板、不
-// 触发任何构建。必要包在沙盒首次使用时按需安装（见 ensureRuntime，跑在
-// 任务预算内、进度走 reasoning 可见），安装状态随沙盒 2h 生命周期归零。
-const APT_PACKAGES =
-  'python3 python3-pip nodejs npm curl wget git unzip ca-certificates tzdata';
+// 平台 API 单次调用超时（2026-10-19 事故修复）：SDK 的 requestJson 无内置
+// 超时——TensorLake API 一旦挂住（网络/平台抖动），整个云函数会被 EdgeOne
+// 120s 强杀，客户端拿到被砍断的空流。所有直连调用必须套这层保险。
+const TL_API_TIMEOUT_MS = 20_000;
+
+function withTimeout(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`${label} 超时（${TL_API_TIMEOUT_MS / 1000}s，TensorLake API 无响应）`)), TL_API_TIMEOUT_MS)),
+  ]);
+}
 
 function imageOpts(env, timeoutSecs) {
+  // TL_IMAGE 可显式指向某个已注册模板名（运维选项）；默认不传 = 平台默认镜像
+  const image = String(env.TL_IMAGE || '').trim();
   return {
     apiKey: env.TENSORLAKE_API_KEY,
     cpus: Number(env.TL_CPUS || DEFAULTS.cpus),
     memoryMb: Number(env.TL_MEMORY_MB || DEFAULTS.memoryMb),
     diskMb: Number(env.TL_DISK_MB || DEFAULTS.diskMb),
     timeoutSecs,
-    // TL_IMAGE 仍可显式指向某个已注册模板名（运维选项）；默认不传 = 平台默认镜像
-    ...(String(env.TL_IMAGE || '').trim() ? { image: String(env.TL_IMAGE).trim() } : {}),
+    ...(image ? { image } : {}),
   };
+}
+
+export async function create(env) {
+  const Sandbox = await _loadSdk();
+  if (!env.TENSORLAKE_API_KEY) throw new Error('TENSORLAKE_API_KEY 未配置');
+  return await withTimeout(Sandbox.create(imageOpts(env, Number(env.TL_TIMEOUT_SECS || DEFAULTS.timeoutSecs))), '创建沙盒');
+}
+
+/**
+ * 会话模式：新建一个长寿命沙盒（timeoutSecs 独立配置，默认 2h 封顶）。
+ * 返回的句柄带 sandboxId，调用方须把它交回客户端作下次复用凭据。
+ */
+export async function createSession(env) {
+  const Sandbox = await _loadSdk();
+  if (!env.TENSORLAKE_API_KEY) throw new Error('TENSORLAKE_API_KEY 未配置');
+  const timeoutSecs = Number(env.SESSION_TIMEOUT_SECS || 7200);
+  return await withTimeout(Sandbox.create(imageOpts(env, timeoutSecs)), '创建会话沙盒');
+}
+
+/**
+ * 会话模式：按客户端持有的 sandboxId 附着已有沙盒。
+ * 成功 → 返回句柄（调用方负责后续 exec）；不存在/已回收 → 抛错由上层新建兜底。
+ */
+export async function connect(env, sandboxId) {
+  const Sandbox = await _loadSdk();
+  if (!env.TENSORLAKE_API_KEY) throw new Error('TENSORLAKE_API_KEY 未配置');
+  return await withTimeout(Sandbox.connect({ apiKey: env.TENSORLAKE_API_KEY, sandboxId: String(sandboxId) }), '接回会话沙盒');
 }
 
 /**
@@ -45,9 +83,8 @@ export async function listAll(env) {
   const mod = await import('./tensorlake-0.5.0-patched.mjs');
   const SandboxClient = mod.SandboxClient;
   if (!SandboxClient) throw new Error('tensorlake: 未找到 SandboxClient 导出');
-  const apiKey = env.TENSORLAKE_API_KEY;
-  if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
-  const client = new SandboxClient({ apiKey }, true);
+  if (!env.TENSORLAKE_API_KEY) throw new Error('TENSORLAKE_API_KEY 未配置');
+  const client = new SandboxClient({ apiKey: env.TENSORLAKE_API_KEY }, true);
   return await withTimeout(client.list(), '列出沙盒');
 }
 
@@ -56,9 +93,8 @@ export async function destroyById(env, sandboxId) {
   const mod = await import('./tensorlake-0.5.0-patched.mjs');
   const SandboxClient = mod.SandboxClient;
   if (!SandboxClient) throw new Error('tensorlake: 未找到 SandboxClient 导出');
-  const apiKey = env.TENSORLAKE_API_KEY;
-  if (!apiKey) throw new Error('TENSORLAKE_API_KEY 未配置');
-  const client = new SandboxClient({ apiKey }, true);
+  if (!env.TENSORLAKE_API_KEY) throw new Error('TENSORLAKE_API_KEY 未配置');
+  const client = new SandboxClient({ apiKey: env.TENSORLAKE_API_KEY }, true);
   await withTimeout(client.delete(String(sandboxId)), '删除沙盒');
 }
 
@@ -77,25 +113,6 @@ export async function initWorkdir(sb) {
   if (String(out).includes('执行异常') || String(out).includes('无法')) {
     console.error(`[sandbox] 工作目录初始化异常: ${out}`);
   }
-}
-
-/**
- * 按需预装运行时（每个沙盒一次）：平台默认镜像未必带 python3/nodejs，
- * 先探测、缺了才 apt 安装（--no-install-recommends 精简）。装包耗时计入
- * 任务预算（1C1G 约 40~70s），失败仅告警——LLM 可在任务中自行重试/绕行。
- */
-export async function ensureRuntime(sb) {
-  const probe = await exec(sb,
-    'for c in python3 node git curl; do command -v $c >/dev/null 2>&1 || echo MISS=$c; done', 20_000);
-  const missing = [...String(probe).matchAll(/MISS=(\S+)/g)].map((m) => m[1]);
-  if (missing.length === 0) return;
-  const pkgMap = { python3: 'python3', node: 'nodejs npm', git: 'git', curl: 'curl' };
-  const pkgs = [...new Set(missing.flatMap((c) => (pkgMap[c] ? pkgMap[c].split(' ') : [])))];
-  if (pkgs.length === 0) return;
-  console.log(`[sandbox] 预装缺失运行时: ${pkgs.join(' ')}`);
-  await exec(sb,
-    'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends '
-    + pkgs.join(' '), 90_000);
 }
 
 /**
