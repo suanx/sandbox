@@ -11,9 +11,11 @@
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
 export async function create(env) {
-  // 内嵌并补丁过的 tensorlake@0.5.0（不要改回 npm 包，原因见 DEPLOY.md）：
-  // - 0.5.0 是最后一个自包含版本（新版拆为 scoped 壳包，EdgeOne 解析不了）
-  // - 补丁点仅一处：创建请求的 ephemeral_disk_mb（API 已废弃）→ disk_mb
+  // 内嵌 tensorlake@0.5.0（纯 HTTP/SSE 实现，无原生二进制依赖）。
+  // 不要换成 npm 上的新版本——0.5.141+ 引入原生二进制绑定
+  // （@tensorlakeai/native-*），EdgeOne 云函数无法加载；两处 API 兼容
+  // 补丁已打进本文件：①创建请求 ephemeral_disk_mb→disk_mb ②（本文件的
+  // exec）整行命令经 /bin/sh -lc 包装。详见 DEPLOY.md。
   const mod = await import('./tensorlake-0.5.0-patched.mjs');
   const Sandbox = mod.Sandbox ?? mod.default?.Sandbox ?? mod.default;
   if (!Sandbox) throw new Error('tensorlake: 未找到 Sandbox 导出，请检查 SDK 版本');
@@ -40,7 +42,15 @@ export async function exec(sb, cmd, timeoutMs = 0) {
   const run = async () => {
     try {
       if (typeof sb.run === 'function') {
-        const r = await sb.run(cmd);
+        // 现行 API：command 只接受单个可执行文件路径，整行命令须经 shell 解释
+        // （官方用法 sbx.run("/bin/sh", { args: ["-c", "..."] })）。
+        // spawn 失败（旧语义/无 shell）时回退整行直传。
+        let r;
+        try {
+          r = await sb.run('/bin/sh', { args: ['-lc', cmd] });
+        } catch {
+          r = await sb.run(cmd);
+        }
         return join(r?.stdout, r?.stderr);
       }
       if (typeof sb.commands?.run === 'function') {

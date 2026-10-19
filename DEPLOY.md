@@ -254,3 +254,17 @@ edgeone.json 未配置 maxDuration，平台默认 30s，而 Tensorlake 沙盒
 创建+启动可能超过 30s。已补 `cloudFunctions.nodejs.maxDuration: 120`
 （与 orion_agent_cloud 同款，实测生效前提是函数跑在 cloud-functions/
 Node runtime 而非 legacy functions/）。
+
+### 命令包装修复 + 为什么不能用最新版（2026-10-19 第五次）
+
+沙盒创建成功后所有命令报 `spawn failed: No such file or directory`：
+现行 Tensorlake API 的 `command` 字段**只接受单个可执行文件路径**
+（官方用法 `sbx.run("/bin/sh", { args: ["-c", "..."] })`），0.5.0 把整行
+命令当二进制名。已在 lib/sandbox.js 的 exec 里经 `/bin/sh -lc` 包装执行，
+spawn 异常时回退整行直传（兼容旧语义）。
+
+**为什么不能用 npm 最新版（0.5.151）**：实测最新版把进程通道改为
+**原生二进制绑定**（optionalDependencies: @tensorlakeai/native-linux-x64-gnu
+等 Rust 编译 .node 文件，缺了直接抛 "Missing native binding package"）。
+EdgeOne 云函数无法安装/加载原生二进制 → 最新版在平台上不可用。
+0.5.0 是最后一个纯 HTTP/SSE 无原生依赖的版本，内嵌+补丁是最终方案。
