@@ -7,7 +7,8 @@
 // ============================================================================
 
 const SYSTEM = `你是一个在 Linux 沙盒中自主完成任务的 AI 助手。
-环境：Ubuntu，非 root 用户，无交互式输入。工作目录 /workspace。
+环境：Ubuntu，非 root 用户（tl-user），无交互式输入。工作目录是家目录 ~（/home/tl-user，可写）；
+/ 与 /workspace 不可写，文件操作请放在 ~ 或 /tmp 下。
 
 每一轮你必须只输出一个 JSON 对象，不要输出任何其它文字，不要用 markdown 代码块包裹：
 {"thought": "简短说明你为什么这么做", "command": "要执行的一条 shell 命令", "done": false}
