@@ -20,6 +20,18 @@
 
 const DEFAULTS = { cpus: 1, memoryMb: 1024, diskMb: 10240, timeoutSecs: 300 };
 
+async function _loadSdk() {
+  // 内嵌 tensorlake@0.5.0（纯 HTTP/SSE 实现，无原生二进制依赖）。
+  // 不要换成 npm 上的新版本——0.5.141+ 引入原生二进制绑定
+  // （@tensorlakeai/native-*），EdgeOne 云函数无法加载；两处 API 兼容
+  // 补丁已打进本文件：①创建请求 ephemeral_disk_mb→disk_mb ②（本文件的
+  // exec）整行命令经 /bin/sh -lc 包装。详见 DEPLOY.md。
+  const mod = await import('./tensorlake-0.5.0-patched.mjs');
+  const Sandbox = mod.Sandbox ?? mod.default?.Sandbox ?? mod.default;
+  if (!Sandbox) throw new Error('tensorlake: 未找到 Sandbox 导出，请检查 SDK 版本');
+  return Sandbox;
+}
+
 // 平台 API 单次调用超时（2026-10-19 事故修复）：SDK 的 requestJson 无内置
 // 超时——TensorLake API 一旦挂住（网络/平台抖动），整个云函数会被 EdgeOne
 // 120s 强杀，客户端拿到被砍断的空流。所有直连调用必须套这层保险。
