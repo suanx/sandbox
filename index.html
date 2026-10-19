@@ -7,36 +7,68 @@
 <link rel="stylesheet" href="style.css"/>
 </head>
 <body>
-<div class="shell">
-  <header class="top">
+<header class="wrap nav">
+  <div class="nav-inner panel">
     <div class="brand">
-      <span class="dot"></span>TENSORLAKE<span class="sep">×</span>AI
+      <span class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>
+        </svg>
+      </span>
+      <span>Tensorlake<span class="sep">×</span><span class="grad">AI</span></span>
       <span class="sub">自主任务执行器</span>
     </div>
-    <div class="stats">
-      <span class="chip" id="statChip">空闲</span>
-      <span class="chip" id="turnChip">0 步</span>
-    </div>
-  </header>
-
-  <section class="pane" id="log"></section>
-
-  <footer class="bar">
-    <span class="prompt">❯</span>
-    <input id="task" placeholder="描述任务，例如：写一个 python 脚本计算斐波那契前 20 项并运行" autocomplete="off" spellcheck="false"/>
-    <button id="send">执行</button>
-    <button id="stop" class="stop" disabled>停止</button>
-  </footer>
-
-  <div class="cfg">
-    <span>Endpoint</span>
-    <input id="ep" value="https://your-project.edgeone.app/api/chat" spellcheck="false"/>
-    <span>Token</span>
-    <input id="tk" type="password" placeholder="orion 令牌（JWT / dt_）"/>
-    <button id="save" class="tiny">保存</button>
+    <span class="live" id="live"><span class="pulse" id="livePulse"></span><span id="liveText">检查中…</span></span>
   </div>
-</div>
-<div class="toast" id="toast"></div>
+</header>
+
+<section class="wrap hero">
+  <span class="tag chip"><span class="dot"></span>Tensorlake 沙盒 · 状态页</span>
+  <h1>AI <span class="grad">自主任务执行器</span></h1>
+  <p class="sub">
+    说一句话描述任务，AI 在云端沙盒里自己写命令、跑脚本、看输出、自我修正，
+    直到完成。一个任务一个沙盒，结束立刻销毁，零留存。
+  </p>
+</section>
+
+<section class="wrap">
+  <div class="status panel" id="status">
+    <span class="pulse big" id="stPulse"></span>
+    <div class="st-main">
+      <div class="st-label" id="stLabel">正在检查服务状态…</div>
+      <div class="st-detail" id="stDetail">—</div>
+    </div>
+    <button class="tiny" id="refresh" type="button">刷新</button>
+  </div>
+</section>
+
+<section class="wrap">
+  <div class="grid">
+    <div class="card">
+      <h3><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>自主多轮执行</h3>
+      <p>LLM 自己规划命令、执行、读输出、修正重试，循环推进直到任务完成。</p>
+    </div>
+    <div class="card">
+      <h3><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></span>一次性沙盒</h3>
+      <p>每个任务独立 Firecracker 沙盒，结束立刻销毁，不保留任何状态与文件。</p>
+    </div>
+    <div class="card">
+      <h3><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17H7A5 5 0 0 1 7 7h2"/><path d="M15 7h2a5 5 0 1 1 0 10h-2"/><path d="M8 12h8"/></svg></span>orion 账号绑定</h3>
+      <p>令牌统一经 orion 云端校验，强制绑定 orion 账号体系，脱离即不可用。</p>
+    </div>
+    <div class="card">
+      <h3><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg></span>预算硬止损</h3>
+      <p>时间预算与单命令超时双重保险，到点强制收尾，成本永远可控。</p>
+    </div>
+  </div>
+</section>
+
+<footer class="wrap foot">
+  <div class="foot-inner panel">
+    <span class="dim">一个任务一个沙盒 · 结束即销毁 · 零留存</span>
+    <span class="dim">由 orion_agent_cloud 统一鉴权</span>
+  </div>
+</footer>
 <script type="module" src="app.js"></script>
 </body>
 </html>
