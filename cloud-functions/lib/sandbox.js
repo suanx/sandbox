@@ -113,43 +113,56 @@ export async function destroyById(env, sandboxId) {
 // 会话/任务的标准工作目录（镜像用户 tl-user 的家目录下，可写）。
 // / 与 /workspace 均不可写（2026-10-19 实测），exec 统一在此目录执行，
 // LLM 的相对路径文件操作因此直接可用。
+//
+// （2026-10-20 优化）原独立 initWorkdir() 一次 exec 往返（~0.5-2s）已取消：
+// exec 现在在 shell 命令行内 `mkdir -p <dir> && cd <dir>` 前置保证工作目录
+// ——mkdir 幂等且本地瞬时（同一 shell 调用，无额外往返），目录已存在时
+// 零开销，且不再依赖 SDK working_dir 参数（该参数在目录缺失时进程直接
+// 启动失败）。
 export const WORKDIR = '/home/tl-user/workspace';
 
 /**
- * 初始化沙盒工作目录（幂等，mkdir -p）。会话沙盒在创建/接回后调用一次；
- * 失败仅告警不抛（exec 的 working_dir 缺目录时进程会启动失败，届时错误
- * 会经命令输出回灌 LLM 自行纠正）。
+ * 清理孤儿沙盒：销毁命名空间内沙盒，返回销毁成功的 id 列表。
+ *
+ * 保护机制（2026-10-20，修复 08:07 误杀活跃会话事故）：
+ *   ① protectIds：调用方（中继）下发的「确认活跃」沙盒 id——服务端零状态
+ *      本无法区分孤儿与在用会话，但中继侧有任务/事件落库，可把最近活跃的
+ *      sandboxId 传进来，清场时跳过；
+ *   ② minAgeMs：能从 list() 解析出创建时间时，跳过创建不满 minAgeMs 的
+ *      沙盒（大概率刚被某会话接管）；字段缺失时退回旧行为（自建单用户
+ *      前提下「现存即孤儿」）。
  */
-export async function initWorkdir(sb) {
-  const out = await exec(sb, `mkdir -p ${WORKDIR}`, 15_000);
-  if (String(out).includes('执行异常') || String(out).includes('无法')) {
-    console.error(`[sandbox] 工作目录初始化异常: ${out}`);
-  }
-}
-
-/**
- * 清理孤儿沙盒：销毁命名空间内全部现存沙盒，返回销毁成功的 id 列表。
- * 自建单用户部署的前提下「现存即孤儿」——正在服务中的沙盒不会被走到
- * 这里（客户端持有其 sandboxId，走 connect 复用路径）。
- */
-export async function destroyAll(env) {
+export async function destroyAll(env, { protectIds = [], minAgeMs = 5 * 60_000 } = {}) {
   const all = await listAll(env);
+  const protect = new Set(protectIds.map(String));
+  const now = Date.now();
   const killed = [];
   for (const s of all ?? []) {
     if (!s?.sandboxId) continue;
-    try { await destroyById(env, s.sandboxId); killed.push(s.sandboxId); } catch { /* 单个失败不阻断 */ }
+    const sid = String(s.sandboxId);
+    if (protect.has(sid)) continue; // 确认活跃：绝不碰
+    if (minAgeMs > 0) {
+      const created = Number(s.createdAt ?? s.createdAtMs ?? s.created_at ?? 0);
+      if (created > 0 && now - created < minAgeMs) continue; // 太新，疑似活跃
+    }
+    try { await destroyById(env, sid); killed.push(sid); } catch { /* 单个失败不阻断 */ }
   }
   return killed;
 }
 
 /**
  * 执行一条命令，返回 stdout+stderr 合并文本（失败也返回，交给 LLM 自己修）。
+ * workdir：命令的工作目录（可写目录，见 WORKDIR）。目录在工作目录在 shell
+ * 行内 `mkdir -p && cd` 保证（幂等、同一次调用、无额外往返），不再用 SDK
+ * 的 working_dir 参数（目录缺失时进程直接启动失败，见 WORKDIR 注释）。
  * timeoutMs > 0 时加单命令等待上限：只放弃【等待】，不杀死沙盒内进程——
  * 防止挂死命令（sleep 1000 / 等 stdin）把整个请求拖穿预算。
- * workdir：命令的工作目录（可写目录，见 WORKDIR）；不传则用镜像默认（家目录）。
  */
 export async function exec(sb, cmd, timeoutMs = 0, workdir) {
-  const opts = workdir ? { args: ['-lc', cmd], workingDir: workdir } : { args: ['-lc', cmd] };
+  const line = workdir
+    ? `mkdir -p '${WORKDIR}' && cd '${WORKDIR}' &&\n${cmd}`
+    : cmd;
+  const opts = { args: ['-lc', line] };
   const run = async () => {
     try {
       if (typeof sb.run === 'function') {
@@ -198,21 +211,50 @@ export async function exec(sb, cmd, timeoutMs = 0, workdir) {
 
 const DESTROY_FNS = ['terminate', 'kill', 'stop', 'close'];
 
-/** 销毁沙盒：逐个尝试可用方式；全部失败时打日志 + 隔 3s 重试一轮。 */
-export async function destroy(sb) {
-  for (const fn of DESTROY_FNS) {
-    if (typeof sb[fn] === 'function') {
-      try { await withTimeout(sb[fn](), `销毁沙盒(${fn})`); return; } catch (e) { console.error(`[sandbox] ${fn}() 失败: ${e?.message ?? e}`); }
+// 销毁总预算（2026-10-20）：此前 4 个函数名 × 20s 超时 × 2 轮 + 3s 间隔，
+// 最坏 ~163s——超出 EdgeOne 120s 平台上限，且 JSON 模式的 busy 锁要等
+// destroy 完成才释放，会拖出连环 429。现在总预算封顶（默认 30s），到点
+// 放弃并交给 destroyById 轻量兜底 / 平台按 timeoutSecs 回收。
+const DESTROY_BUDGET_MS = 30_000;
+
+/**
+ * 销毁沙盒：逐个尝试可用方式（总预算封顶）；全部失败时走 destroyById
+ * 轻量 DELETE API 兜底（无需 connect 建隧道）。两路都失败才放弃——沙盒
+ * 按 timeoutSecs 由平台回收。
+ */
+export async function destroy(env, sb) {
+  const t0 = Date.now();
+  const tryFns = async (label) => {
+    for (const fn of DESTROY_FNS) {
+      if (typeof sb[fn] !== 'function') continue;
+      if (Date.now() - t0 > DESTROY_BUDGET_MS) return false; // 预算耗尽
+      try {
+        await withTimeout(sb[fn](), `销毁沙盒(${label}/${fn})`);
+        return true;
+      } catch (e) {
+        console.error(`[sandbox] ${fn}() 失败: ${e?.message ?? e}`);
+      }
+    }
+    return false;
+  };
+
+  if (await tryFns('首轮')) return;
+
+  // 首轮失败：不再盲试 4 个函数名，直接走 destroyById（按 id DELETE，最准）
+  const sid = sb?.sandboxId ? String(sb.sandboxId) : '';
+  if (sid && env?.TENSORLAKE_API_KEY) {
+    try {
+      await withTimeout(destroyById(env, sid), '销毁沙盒(destroyById 兜底)');
+      console.log('[sandbox] destroyById 兜底销毁成功');
+      return;
+    } catch (e) {
+      console.error(`[sandbox] destroyById 兜底失败: ${e?.message ?? e}`);
     }
   }
-  console.error('[sandbox] 首轮销毁全部失败，3s 后重试一轮');
-  await new Promise(r => setTimeout(r, 3000));
-  for (const fn of DESTROY_FNS) {
-    if (typeof sb[fn] === 'function') {
-      try { await withTimeout(sb[fn](), `销毁沙盒重试(${fn})`); console.log('[sandbox] 重试销毁成功'); return; } catch { /* 继续下一个 */ }
-    }
-  }
-  console.error('[sandbox] 销毁彻底失败，沙盒将按 TL_TIMEOUT_SECS 兜底回收（可能产生少量费用）');
+
+  // 最后重试一轮句柄方法（此时预算大概率已尽，能试多少试多少）
+  await tryFns('重试');
+  console.error('[sandbox] 销毁彻底失败，沙盒将按 timeoutSecs 兜底回收（可能产生少量费用）');
 }
 
 function join(out, err) {
